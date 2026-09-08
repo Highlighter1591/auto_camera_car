@@ -338,8 +338,8 @@
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
     });
     faceDetection.setOptions({
-      model: 'short',
-      minDetectionConfidence: 0.6
+      model: 'full',
+      minDetectionConfidence: 0.3
     });
     faceDetection.onResults(onResults);
 
@@ -349,8 +349,8 @@
         await faceDetection.send({ image: videoElement });
       },
       facingMode: 'environment', // 強制開啟後鏡頭
-      width: 1280,
-      height: 720
+      width: 1920,
+      height: 1080
     });
     camera.start();
 
