@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>AI 攝影機器人取景大腦</title>
+  
+  <!-- 載入 MediaPipe Face Detection 與 Camera 工具 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background-color: #121212; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+    
+    #viewport {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #000;
+    }
+
+    video { display: none; }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* 頂部控制列 */
+    .top-bar {
+      position: absolute;
+      top: 15px;
+      left: 15px;
+      right: 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+
+    .btn {
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 14px;
+      backdrop-filter: blur(8px);
+      cursor: pointer;
+    }
+    .btn.connected { background: #28a745; border-color: #28a745; }
+
+    /* 構圖狀態面板 */
+    .status-card {
+      position: absolute;
+      bottom: 100px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.6);
+      padding: 8px 20px;
+      border-radius: 30px;
+      font-size: 13px;
+      letter-spacing: 1px;
+      backdrop-filter: blur(5px);
+      z-index: 10;
+      white-space: nowrap;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+
+    /* 拍照實體快門鍵 */
+    .shutter-btn {
+      position: absolute;
+      bottom: 25px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 65px;
+      height: 65px;
+      border-radius: 50%;
+      background: #fff;
+      border: 4px solid rgba(0,0,0,0.2);
+      box-shadow: 0 0 0 3px #fff;
+      z-index: 10;
+      cursor: pointer;
+    }
+    .shutter-btn:active { transform: translateX(-50%) scale(0.92); }
+  </style>
+</head>
+<body>
+
+  <div id="viewport">
+    <video id="webcam" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div class="top-bar">
+      <button id="bleBtn" class="btn">連接 ESP32 藍牙</button>
+      <div id="fpsText" style="font-size: 12px; opacity: 0.7;">FPS: --</div>
+    </div>
+
+    <div id="statusIndicator" class="status-card">尋找主體中...</div>
+    <button id="shutterBtn" class="shutter-btn"></button>
+  </div>
+
+  <script>
+    const videoElement = document.getElementById('webcam');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const bleBtn = document.getElementById('bleBtn');
+    const statusIndicator = document.getElementById('statusIndicator');
+    const shutterBtn = document.getElementById('shutterBtn');
+    const fpsText = document.getElementById('fpsText');
+
+    // BLE 參數 (採用 Nordic UART Service 標準 UUID)
+    const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+    const NUS_RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+    let rxCharacteristic = null;
+    let lastSendTime = 0;
+    const SEND_INTERVAL_MS = 100; // 限制 10Hz 發送頻率，避免塞爆藍牙緩衝
+
+    // 1. Web Bluetooth 連接
+    bleBtn.addEventListener('click', async () => {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'ESP32' }, { namePrefix: 'PhotoBot' }],
+          optionalServices: [NUS_SERVICE_UUID]
+        });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+        rxCharacteristic = await service.getCharacteristic(NUS_RX_UUID);
+        
+        bleBtn.textContent = "已連線至小車";
+        bleBtn.classList.add("connected");
+      } catch (err) {
+        alert("藍牙連接失敗: " + err);
+      }
+    });
+
+    async function sendESP32(cmd) {
+      if (!rxCharacteristic) return;
+      const now = performance.now();
+      if (now - lastSendTime < SEND_INTERVAL_MS) return;
+      
+      try {
+        const encoder = new TextEncoder();
+        await rxCharacteristic.writeValue(encoder.encode(cmd + '\n'));
+        lastSendTime = now;
+      } catch (e) {
+        console.warn("BLE Write Fail:", e);
+      }
+    }
+
+    // 2. 幾何規則構圖決策
+    function evaluateComposition(box, imgW, imgH) {
+      // box: { xCenter, yCenter, width, height } 正規化座標 (0.0 ~ 1.0)
+      const faceX = box.xCenter;
+      const faceY = box.yCenter;
+      const faceH = box.height;
+
+      // 攝影三分法則標準靶位：
+      // 人物擺在畫面上三分之一處 (y ≈ 0.33)，水平置中或偏側 1/3 (x ≈ 0.5)
+      const TARGET_X = 0.50;
+      const TARGET_Y = 0.35; 
+      const TARGET_H = 0.25; // 人臉高度佔畫面 25% (半身/胸前構圖)
+
+      const errX = faceX - TARGET_X; // >0: 人偏右, <0: 人偏左
+      const errY = faceY - TARGET_Y; // >0: 人偏下, <0: 人偏上
+      const errH = faceH - TARGET_H; // >0: 太近,   <0: 太遠
+
+      const DEADZONE = 0.05; // 5% 容許死區，避免馬達震盪抖動
+
+      let actionText = "構圖良好，鎖定目標";
+      let vx = 0, vy = 0, pitch = 90, lift = 0;
+
+      // 前後距離控制 (小車前進 / 後退)
+      if (errH < -0.08) {
+        vx = 20; // 人太小，往前開
+        actionText = "靠近主體中...";
+      } else if (errH > 0.08) {
+        vx = -20; // 人太大，往後退
+        actionText = "退後調整焦距...";
+      }
+
+      // 水平橫移控制 (底盤麥克納姆輪左右平移)
+      if (errX > DEADZONE) {
+        vy = 15; // 往右橫移對齊
+        actionText = "向右微調構圖";
+      } else if (errX < -DEADZONE) {
+        vy = -15; // 往左橫移
+        actionText = "向左微調構圖";
+      }
+
+      // 垂直高度調整 (高度推桿或雲台俯仰)
+      if (errY > DEADZONE) {
+        lift = -1; // 人太低，推桿下降
+      } else if (errY < -DEADZONE) {
+        lift = 1;  // 人太高，推桿上升
+      }
+
+      // 送出底盤控制封包: $MOVE,vx,vy,w#
+      sendESP32(`$MOVE,${vx},${vy},0#`);
+      // 送出推桿封包: $LIFT,state#
+      if (lift !== 0) sendESP32(`$LIFT,${lift}#`);
+
+      return actionText;
+    }
+
+    // 3. 畫面繪製 (九宮格、人臉標註框)
+    function drawGrid(w, h) {
+      canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+      canvasCtx.lineWidth = 1;
+
+      // 繪製垂直三分線
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(w / 3, 0); canvasCtx.lineTo(w / 3, h);
+      canvasCtx.moveTo((w * 2) / 3, 0); canvasCtx.lineTo((w * 2) / 3, h);
+      // 繪製水平三分線
+      canvasCtx.moveTo(0, h / 3); canvasCtx.lineTo(w, h / 3);
+      canvasCtx.moveTo(0, (h * 2) / 3); canvasCtx.lineTo(w, (h * 2) / 3);
+      canvasCtx.stroke();
+    }
+
+    let frameCount = 0, lastFpsUpdate = 0;
+
+    function onResults(results) {
+      // 刷新 FPS 計數
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsUpdate >= 1000) {
+        fpsText.textContent = `FPS: ${frameCount}`;
+        frameCount = 0;
+        lastFpsUpdate = now;
+      }
+
+      canvasElement.width = videoElement.videoWidth;
+      canvasElement.height = videoElement.videoHeight;
+      const w = canvasElement.width;
+      const h = canvasElement.height;
+
+      canvasCtx.save();
+      canvasCtx.drawImage(results.image, 0, 0, w, h);
+      drawGrid(w, h);
+
+      if (results.detections && results.detections.length > 0) {
+        const detection = results.detections[0]; // 追蹤第一位主要人物
+        const box = detection.boundingBox;
+
+        // 計算中心點與長寬 (正規化 0~1)
+        const normBox = {
+          xCenter: box.xCenter,
+          yCenter: box.yCenter,
+          width: box.width,
+          height: box.height
+        };
+
+        // 繪製人臉 Bounding Box
+        canvasCtx.strokeStyle = '#00FF66';
+        canvasCtx.lineWidth = 3;
+        canvasCtx.strokeRect(
+          (box.xCenter - box.width / 2) * w,
+          (box.yCenter - box.height / 2) * h,
+          box.width * w,
+          box.height * h
+        );
+
+        // 執行幾何決策並更新介面
+        const actionStr = evaluateComposition(normBox, w, h);
+        statusIndicator.textContent = actionStr;
+      } else {
+        statusIndicator.textContent = "未發現人臉，巡航待機中";
+        sendESP32("$MOVE,0,0,0#"); // 煞車待機
+      }
+      canvasCtx.restore();
+    }
+
+    // 4. 初始化 MediaPipe Face Detection
+    const faceDetection = new FaceDetection({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
+    });
+    faceDetection.setOptions({
+      model: 'short',
+      minDetectionConfidence: 0.6
+    });
+    faceDetection.onResults(onResults);
+
+    // 5. 啟動手機後置鏡頭
+    const camera = new Camera(videoElement, {
+      onFrame: async () => {
+        await faceDetection.send({ image: videoElement });
+      },
+      facingMode: 'environment', // 強制開啟後鏡頭
+      width: 1280,
+      height: 720
+    });
+    camera.start();
+
+    // 拍照快門按鈕
+    shutterBtn.addEventListener('click', () => {
+      sendESP32("$SNAP#");
+      // 畫面閃爍回饋
+      canvasElement.style.opacity = '0.3';
+      setTimeout(() => canvasElement.style.opacity = '1.0', 150);
+      
+      // 自動下載目前高畫質畫面
+      const link = document.createElement('a');
+      link.download = `PhotoBot_${Date.now()}.png`;
+      link.href = canvasElement.toDataURL('image/png');
+      link.click();
+    });
+  </script>
+</body>
+</html>
