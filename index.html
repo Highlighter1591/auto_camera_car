@@ -33,6 +33,7 @@
       object-fit: cover;
     }
 
+    /* 頂部控制列 */
     .top-bar {
       position: absolute;
       top: 15px;
@@ -56,6 +57,7 @@
     }
     .btn.connected { background: #28a745; border-color: #28a745; }
 
+    /* 構圖狀態面板 */
     .status-card {
       position: absolute;
       bottom: 100px;
@@ -72,6 +74,7 @@
       border: 1px solid rgba(255,255,255,0.15);
     }
 
+    /* 拍照實體快門鍵 */
     .shutter-btn {
       position: absolute;
       bottom: 25px;
@@ -113,12 +116,14 @@
     const shutterBtn = document.getElementById('shutterBtn');
     const fpsText = document.getElementById('fpsText');
 
+    // BLE 參數 (採用 Nordic UART Service 標準 UUID)
     const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
     const NUS_RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
     let rxCharacteristic = null;
     let lastSendTime = 0;
-    const SEND_INTERVAL_MS = 100;
+    const SEND_INTERVAL_MS = 100; // 限制 10Hz 發送頻率，避免塞爆藍牙緩衝
 
+    // 1. Web Bluetooth 連接
     bleBtn.addEventListener('click', async () => {
       try {
         const device = await navigator.bluetooth.requestDevice({
@@ -150,13 +155,71 @@
       }
     }
 
+    // 2. 幾何規則構圖決策
+    function evaluateComposition(box, imgW, imgH) {
+      // box: { xCenter, yCenter, width, height } 正規化座標 (0.0 ~ 1.0)
+      const faceX = box.xCenter;
+      const faceY = box.yCenter;
+      const faceH = box.height;
+
+      // 攝影三分法則標準靶位：
+      // 人物擺在畫面上三分之一處 (y ≈ 0.33)，水平置中或偏側 1/3 (x ≈ 0.5)
+      const TARGET_X = 0.50;
+      const TARGET_Y = 0.35; 
+      const TARGET_H = 0.25; // 人臉高度佔畫面 25% (半身/胸前構圖)
+
+      const errX = faceX - TARGET_X; // >0: 人偏右, <0: 人偏左
+      const errY = faceY - TARGET_Y; // >0: 人偏下, <0: 人偏上
+      const errH = faceH - TARGET_H; // >0: 太近,   <0: 太遠
+
+      const DEADZONE = 0.05; // 5% 容許死區，避免馬達震盪抖動
+
+      let actionText = "構圖良好，鎖定目標";
+      let vx = 0, vy = 0, pitch = 90, lift = 0;
+
+      // 前後距離控制 (小車前進 / 後退)
+      if (errH < -0.08) {
+        vx = 20; // 人太小，往前開
+        actionText = "靠近主體中...";
+      } else if (errH > 0.08) {
+        vx = -20; // 人太大，往後退
+        actionText = "退後調整焦距...";
+      }
+
+      // 水平橫移控制 (底盤麥克納姆輪左右平移)
+      if (errX > DEADZONE) {
+        vy = 15; // 往右橫移對齊
+        actionText = "向右微調構圖";
+      } else if (errX < -DEADZONE) {
+        vy = -15; // 往左橫移
+        actionText = "向左微調構圖";
+      }
+
+      // 垂直高度調整 (高度推桿或雲台俯仰)
+      if (errY > DEADZONE) {
+        lift = -1; // 人太低，推桿下降
+      } else if (errY < -DEADZONE) {
+        lift = 1;  // 人太高，推桿上升
+      }
+
+      // 送出底盤控制封包: $MOVE,vx,vy,w#
+      sendESP32(`$MOVE,${vx},${vy},0#`);
+      // 送出推桿封包: $LIFT,state#
+      if (lift !== 0) sendESP32(`$LIFT,${lift}#`);
+
+      return actionText;
+    }
+
+    // 3. 畫面繪製 (九宮格、人臉標註框)
     function drawGrid(w, h) {
       canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
       canvasCtx.lineWidth = 1;
 
+      // 繪製垂直三分線
       canvasCtx.beginPath();
       canvasCtx.moveTo(w / 3, 0); canvasCtx.lineTo(w / 3, h);
       canvasCtx.moveTo((w * 2) / 3, 0); canvasCtx.lineTo((w * 2) / 3, h);
+      // 繪製水平三分線
       canvasCtx.moveTo(0, h / 3); canvasCtx.lineTo(w, h / 3);
       canvasCtx.moveTo(0, (h * 2) / 3); canvasCtx.lineTo(w, (h * 2) / 3);
       canvasCtx.stroke();
@@ -165,102 +228,112 @@
     let frameCount = 0, lastFpsUpdate = 0;
 
     function onResults(results) {
-      frameCount++;
-      const now = performance.now();
-      if (now - lastFpsUpdate >= 1000) {
-        fpsText.textContent = `FPS: ${frameCount}`;
-        frameCount = 0;
-        lastFpsUpdate = now;
-      }
-
-      canvasElement.width = videoElement.videoWidth;
-      canvasElement.height = videoElement.videoHeight;
-      const w = canvasElement.width;
-      const h = canvasElement.height;
-
-      canvasCtx.save();
-      canvasCtx.drawImage(results.image, 0, 0, w, h);
-      drawGrid(w, h);
-
-      const numPeople = results.detections ? results.detections.length : 0;
-
-      if (numPeople > 0) {
-        let minX = 1.0, maxX = 0.0;
-        let minY = 1.0, maxY = 0.0;
-
-        results.detections.forEach((detection) => {
-          const b = detection.boundingBox;
-          const left   = b.xCenter - b.width / 2;
-          const right  = b.xCenter + b.width / 2;
-          const top    = b.yCenter - b.height / 2;
-          const bottom = b.yCenter + b.height / 2;
-
-          if (left < minX) minX = left;
-          if (right > maxX) maxX = right;
-          if (top < minY) minY = top;
-          if (bottom > maxY) maxY = bottom;
-
-          canvasCtx.strokeStyle = '#00FF66';
-          canvasCtx.lineWidth = 2;
-          canvasCtx.strokeRect(left * w, top * h, b.width * w, b.height * h);
-        });
-
-        const groupW = maxX - minX;
-        const groupH = maxY - minY;
-        const groupCenterX = (minX + maxX) / 2;
-        const groupCenterY = (minY + maxY) / 2;
-
-        if (numPeople > 1) {
-          canvasCtx.strokeStyle = '#00E5FF';
-          canvasCtx.lineWidth = 2;
-          canvasCtx.setLineDash([6, 6]);
-          canvasCtx.strokeRect(minX * w, minY * h, groupW * w, groupH * h);
-          canvasCtx.setLineDash([]);
-        }
-
-        const TARGET_X = 0.50;
-        const TARGET_Y = 0.35;
-        const errX = groupCenterX - TARGET_X;
-        const errY = minY - 0.20;
-
-        let vx = 0, vy = 0, lift = 0;
-        let actionText = `鎖定 ${numPeople} 人，構圖良好`;
-
-        if (errX > 0.06) {
-          vy = 15;
-          actionText = `多人對齊：向右平移`;
-        } else if (errX < -0.06) {
-          vy = -15;
-          actionText = `多人對齊：向左平移`;
-        }
-
-        if (groupW > 0.65) {
-          vx = -20;
-          actionText = `人群超出視野，後退擴大範圍`;
-        } else if (groupW < 0.25 && numPeople === 1) {
-          vx = 20;
-          actionText = `靠近主體中...`;
-        }
-
-        if (errY > 0.08) {
-          lift = -1;
-        } else if (errY < -0.08) {
-          lift = 1;
-        }
-
-        sendESP32(`$MOVE,${vx},${vy},0#`);
-        if (lift !== 0) sendESP32(`$LIFT,${lift}#`);
-
-        statusIndicator.textContent = actionText;
-
-      } else {
-        statusIndicator.textContent = "未發現人臉，巡航待機中";
-        sendESP32("$MOVE,0,0,0#");
-      }
-
-      canvasCtx.restore();
+    frameCount++;
+    const now = performance.now();
+    if (now - lastFpsUpdate >= 1000) {
+      fpsText.textContent = `FPS: ${frameCount}`;
+      frameCount = 0;
+      lastFpsUpdate = now;
     }
 
+    canvasElement.width = videoElement.videoWidth;
+    canvasElement.height = videoElement.videoHeight;
+    const w = canvasElement.width;
+    const h = canvasElement.height;
+
+    canvasCtx.save();
+    canvasCtx.drawImage(results.image, 0, 0, w, h);
+    drawGrid(w, h);
+
+    const numPeople = results.detections ? results.detections.length : 0;
+
+    if (numPeople > 0) {
+      let minX = 1.0, maxX = 0.0;
+      let minY = 1.0, maxY = 0.0;
+
+      // 1. 遍歷所有人臉，繪製個別綠框並計算群組極值邊界
+      results.detections.forEach((detection) => {
+        const b = detection.boundingBox;
+        const left   = b.xCenter - b.width / 2;
+        const right  = b.xCenter + b.width / 2;
+        const top    = b.yCenter - b.height / 2;
+        const bottom = b.yCenter + b.height / 2;
+
+        if (left < minX) minX = left;
+        if (right > maxX) maxX = right;
+        if (top < minY) minY = top;
+        if (bottom > maxY) maxY = bottom;
+
+        // 畫單人臉框
+        canvasCtx.strokeStyle = '#00FF66';
+        canvasCtx.lineWidth = 2;
+        canvasCtx.strokeRect(left * w, top * h, b.width * w, b.height * h);
+      });
+
+      // 2. 多人外接群體大框參數
+      const groupW = maxX - minX;
+      const groupH = maxY - minY;
+      const groupCenterX = (minX + maxX) / 2;
+      const groupCenterY = (minY + maxY) / 2;
+
+      // 3. 繪製多人藍色包圍框 (僅 2 人以上時顯示)
+      if (numPeople > 1) {
+        canvasCtx.strokeStyle = '#00E5FF';
+        canvasCtx.lineWidth = 2;
+        canvasCtx.setLineDash([6, 6]);
+        canvasCtx.strokeRect(minX * w, minY * h, groupW * w, groupH * h);
+        canvasCtx.setLineDash([]);
+      }
+
+      // 4. 多人幾何構圖決策
+      const TARGET_X = 0.50; // 群體整體居中
+      const TARGET_Y = 0.35; // 視線水平維持在上三分線
+      const errX = groupCenterX - TARGET_X;
+      const errY = minY - 0.20; // 讓最高的人頭頂距離畫面頂端保留 20% 留白
+
+      let vx = 0, vy = 0, lift = 0;
+      let actionText = `鎖定 ${numPeople} 人，構圖良好`;
+
+      // 左右平移 (對齊群體中心)
+      if (errX > 0.06) {
+        vy = 15;
+        actionText = `多人對齊：向右平移`;
+      } else if (errX < -0.06) {
+        vy = -15;
+        actionText = `多人對齊：向左平移`;
+      }
+
+      // 前後距離控制 (避免邊緣出鏡)
+      if (groupW > 0.65) {
+        vx = -20; // 人群太散或太近，後退廣角
+        actionText = `人群超出視野，後退擴大範圍`;
+      } else if (groupW < 0.25 && numPeople === 1) {
+        vx = 20;  // 單人且太遠時向前靠近
+        actionText = `靠近主體中...`;
+      }
+
+      // 高度控制
+      if (errY > 0.08) {
+        lift = -1; // 整體偏下，推桿下降
+      } else if (errY < -0.08) {
+        lift = 1;  // 整體偏上，推桿上升
+      }
+
+      // 發送控制指令給 ESP32
+      sendESP32(`$MOVE,${vx},${vy},0#`);
+      if (lift !== 0) sendESP32(`$LIFT,${lift}#`);
+
+      statusIndicator.textContent = actionText;
+
+    } else {
+      statusIndicator.textContent = "未發現人臉，巡航待機中";
+      sendESP32("$MOVE,0,0,0#");
+    }
+
+    canvasCtx.restore();
+  }
+
+    // 4. 初始化 MediaPipe Face Detection
     const faceDetection = new FaceDetection({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
     });
@@ -270,21 +343,25 @@
     });
     faceDetection.onResults(onResults);
 
+    // 5. 啟動手機後置鏡頭
     const camera = new Camera(videoElement, {
       onFrame: async () => {
         await faceDetection.send({ image: videoElement });
       },
-      facingMode: 'environment',
+      facingMode: 'environment', // 強制開啟後鏡頭
       width: 1280,
       height: 720
     });
     camera.start();
 
+    // 拍照快門按鈕
     shutterBtn.addEventListener('click', () => {
       sendESP32("$SNAP#");
+      // 畫面閃爍回饋
       canvasElement.style.opacity = '0.3';
       setTimeout(() => canvasElement.style.opacity = '1.0', 150);
       
+      // 自動下載目前高畫質畫面
       const link = document.createElement('a');
       link.download = `PhotoBot_${Date.now()}.png`;
       link.href = canvasElement.toDataURL('image/png');
