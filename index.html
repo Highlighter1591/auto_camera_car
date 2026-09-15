@@ -121,7 +121,8 @@
     bleBtn.addEventListener('click', async () => {
       try {
         const device = await navigator.bluetooth.requestDevice({
-          filters: [{ namePrefix: 'AI_Cameraman_ESP32' }, { namePrefix: 'PhotoBot' }],
+          //filters: [{ namePrefix: 'AI_Cameraman_ESP32' }, { namePrefix: 'PhotoBot' }],
+          acceptAllDevices: true,
           optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
         });
         const server = await device.gatt.connect();
