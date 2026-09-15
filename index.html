@@ -121,8 +121,8 @@
     bleBtn.addEventListener('click', async () => {
       try {
         const device = await navigator.bluetooth.requestDevice({
-          filters: [{ namePrefix: 'ESP32' }, { namePrefix: 'PhotoBot' }],
-          optionalServices: [NUS_SERVICE_UUID]
+          filters: [{ namePrefix: 'AI_Cameraman_ESP32' }, { namePrefix: 'PhotoBot' }],
+          optionalServices: [6e400001-b5a3-f393-e0a9-e50e24dcca9e]
         });
         const server = await device.gatt.connect();
         const service = await server.getPrimaryService(NUS_SERVICE_UUID);
