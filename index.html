@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>AI 自動攝影車 — 取景大腦 v2</title>
+
+<!-- 鎖定版本：避免 CDN 更新造成展示當天掛掉。若載入失敗，把 @版本號 拿掉再試。 -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js" crossorigin="anonymous"></script>
+
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{background:#0a0a0c;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;overflow:hidden;height:100vh}
+  #stage{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;background:#000}
+  video{display:none}
+  canvas#view{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+
+  .hud{position:absolute;z-index:10}
+  .topbar{top:calc(env(safe-area-inset-top) + 12px);left:12px;right:12px;display:flex;gap:8px;align-items:center}
+  .chip{background:rgba(20,20,24,.72);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:7px 14px;font-size:13px;backdrop-filter:blur(10px);white-space:nowrap}
+  .chip.act{cursor:pointer}
+  .chip.ok{background:rgba(24,140,70,.85);border-color:#2ecc71}
+  .chip.bad{background:rgba(160,30,40,.85);border-color:#e74c3c}
+  .spacer{flex:1}
+  .mono{font-variant-numeric:tabular-nums;font-size:12px;opacity:.75}
+
+  .modes{left:12px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
+  .mode{background:rgba(20,20,24,.7);border:1px solid rgba(255,255,255,.18);border-radius:12px;padding:10px 12px;font-size:13px;text-align:center;cursor:pointer;backdrop-filter:blur(10px)}
+  .mode.sel{background:rgba(0,180,220,.9);border-color:#00e5ff;font-weight:600}
+
+  .status{bottom:calc(env(safe-area-inset-bottom) + 108px);left:50%;transform:translateX(-50%);background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:9px 22px;font-size:13.5px;letter-spacing:.5px;backdrop-filter:blur(8px);white-space:nowrap;max-width:92vw;overflow:hidden;text-overflow:ellipsis}
+  .status.lock{border-color:#2ecc71;box-shadow:0 0 18px rgba(46,204,113,.35)}
+
+  .dock{bottom:calc(env(safe-area-inset-bottom) + 22px);left:0;right:0;display:flex;align-items:center;justify-content:center;gap:26px}
+  .shutter{width:68px;height:68px;border-radius:50%;background:#fff;border:4px solid rgba(0,0,0,.25);box-shadow:0 0 0 3px #fff;cursor:pointer}
+  .shutter:active{transform:scale(.92)}
+  .pill{min-width:74px;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,.2);background:rgba(20,20,24,.75);font-size:13px;text-align:center;cursor:pointer;backdrop-filter:blur(10px)}
+  .pill.on{background:rgba(0,180,220,.9);border-color:#00e5ff;font-weight:600}
+  .pill.stop{background:#c0392b;border-color:#e74c3c;font-weight:700}
+  .pill.stop.latched{background:#fff;color:#c0392b;animation:bl .7s infinite}
+  @keyframes bl{50%{opacity:.45}}
+
+  .count{left:50%;top:44%;transform:translate(-50%,-50%);font-size:110px;font-weight:800;text-shadow:0 0 40px rgba(0,0,0,.9);pointer-events:none;opacity:.95}
+  .flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:20;transition:opacity .12s}
+  .hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="view"></canvas>
+  <div class="flash" id="flash"></div>
+
+  <div class="hud topbar">
+    <div id="bleBtn" class="chip act">連接小車</div>
+    <div class="spacer"></div>
+    <div id="tele" class="chip mono">FPS -- · TX --</div>
+  </div>
+
+  <div class="hud modes">
+    <div class="mode sel" data-mode="full">全身</div>
+    <div class="mode" data-mode="half">半身</div>
+    <div class="mode" data-mode="close">特寫</div>
+  </div>
+
+  <div id="count" class="hud count hide">3</div>
+  <div id="status" class="hud status">初始化中…</div>
+
+  <div class="hud dock">
+    <div id="autoBtn" class="pill on">自動 ON</div>
+    <div id="shutter" class="shutter"></div>
+    <div id="estopBtn" class="pill stop">停止</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════
+   1. 可調參數 — 實機一定要現場校正這一區
+   ═══════════════════════════════════════════════════════════ */
+const TUNE = {
+  // ── 雲台（積分型視覺伺服：角度每秒變化 = K × 畫面誤差）
+  panK: 55, tiltK: 45,          // 度/秒。太大會抖，太小追不上
+  panInvert: false,             // 舵機裝反就改 true
+  tiltInvert: false,
+  panMin: 15, panMax: 165, panCenter: 90,
+  tiltMin: 45, tiltMax: 135, tiltCenter: 90,
+
+  // ── 車體
+  yawK: 0.85,                   // 雲台每偏離 1 度 → 車體轉速
+  yawDead: 8,                   // 雲台偏離幾度內不轉車
+  yawMax: 32,
+  fwdK: 70,                     // 距離相對誤差 → 前後速度
+  fwdMax: 38,
+  fwdBackMax: 30,
+  slew: 3.5,                    // 每 tick 最大速度變化（防暴衝）
+
+  // ── 推桿（跟隨 tilt：要抬頭就升高、要低頭就下降）
+  liftDead: 12,                 // tilt 偏離水平幾度後才動推桿
+
+  // ── 死區
+  deadX: 0.035, deadY: 0.05, deadScale: 0.10,
+
+  // ── 構圖目標（torso = 肩中點→髖中點長度，以「畫面高」為單位）
+  //    這三組數字務必實測調整：站在目標距離，看畫面上 torso 讀數多少就填多少
+  modes: {
+    full:  { torso: 0.22, y: 0.45, label: "全身" },
+    half:  { torso: 0.40, y: 0.38, label: "半身" },
+    close: { torso: 0.62, y: 0.66, label: "特寫" }
+  },
+
+  sendHz: 20,                   // 控制封包發送頻率
+  poseTimeout: 500,             // 超過這時間沒看到人 → 全停
+  lockHold: 1000,               // 構圖穩定多久後啟動倒數
+  cooldown: 6000                // 拍完冷卻
+};
+
+/* ═══════════════════════════════════════════════════════════
+   2. 狀態
+   ═══════════════════════════════════════════════════════════ */
+const S = {
+  hasTarget:false, lastPoseAt:0,
+  errX:0, errY:0, errScale:0, scaleConf:1, torso:0,
+  pan:TUNE.panCenter, tilt:TUNE.tiltCenter,
+  vx:0, vy:0, yaw:0, lift:0,
+  mode:"full", auto:true, estop:false,
+  locked:false, lockAt:0, lastShot:0, counting:false,
+  fps:0, tx:0, connected:false, note:"初始化中…"
+};
+
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+const dead  = (v,d) => Math.abs(v)<d ? 0 : v - Math.sign(v)*d;
+
+/* ═══════════════════════════════════════════════════════════
+   3. 藍牙 (Nordic UART Service)
+   ═══════════════════════════════════════════════════════════ */
+const NUS  = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // 手機 → ESP32
+const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 → 手機（電量/限位等）
+
+let bleDev = null, rxChar = null, bleBusy = false, txCount = 0, canWriteNR = false;
+
+$("bleBtn").onclick = async () => {
+  if (!navigator.bluetooth) {
+    alert("此瀏覽器不支援 Web Bluetooth。\n請用 Android 的 Chrome / Edge，且網址必須是 HTTPS。\n(iOS 的 Safari 與 Chrome 都不支援)");
+    return;
+  }
+  try {
+    bleDev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'AI_Cameraman' }],
+      optionalServices: [NUS]
+    });
+    bleDev.addEventListener('gattserverdisconnected', onBleLost);
+    const srv = await bleDev.gatt.connect();
+    const svc = await srv.getPrimaryService(NUS);
+    rxChar = await svc.getCharacteristic(NUS_RX);
+    canWriteNR = rxChar.properties.writeWithoutResponse;
+
+    // 選配：訂閱 ESP32 回傳（電量、限位開關、超音波距離…）
+    try {
+      const txChar = await svc.getCharacteristic(NUS_TX);
+      await txChar.startNotifications();
+      txChar.addEventListener('characteristicvaluechanged', e => {
+        onTelemetry(new TextDecoder().decode(e.target.value));
+      });
+    } catch (_) { /* ESP32 沒開 TX 也能運作 */ }
+
+    S.connected = true;
+    $("bleBtn").textContent = "已連線";
+    $("bleBtn").classList.add("ok");
+  } catch (e) {
+    if (e && e.name === 'NotFoundError') return;   // 使用者自己取消
+    alert("藍牙連線失敗：" + e);
+  }
+};
+
+function onBleLost() {
+  S.connected = false; rxChar = null;
+  S.vx = S.vy = S.yaw = S.lift = 0;
+  $("bleBtn").textContent = "已斷線 · 重連";
+  $("bleBtn").classList.remove("ok");
+  $("bleBtn").classList.add("bad");
+  setNote("⚠ 藍牙已斷線");
+}
+
+// 寫入序列化：BLE 一次只能有一筆 GATT 操作，塞爆會整個卡死
+async function bleSend(str) {
+  if (!rxChar || bleBusy) return false;
+  bleBusy = true;
+  try {
+    const buf = new TextEncoder().encode(str + "\n");
+    if (canWriteNR) await rxChar.writeValueWithoutResponse(buf);
+    else            await rxChar.writeValue(buf);
+    txCount++;
+    return true;
+  } catch (e) {
+    console.warn("BLE write fail", e);
+    return false;
+  } finally { bleBusy = false; }
+}
+
+let lastTele = "";
+function onTelemetry(line) { lastTele = line.trim(); }
+
+/* ═══════════════════════════════════════════════════════════
+   4. 控制迴路（固定 20Hz，與視覺 FPS 解耦 → ESP32 watchdog 才穩）
+   ═══════════════════════════════════════════════════════════ */
+function controlTick() {
+  const now = performance.now();
+  const dt  = 1 / TUNE.sendHz;
+  const fresh = S.hasTarget && (now - S.lastPoseAt) < TUNE.poseTimeout;
+
+  let tvx = 0, tyaw = 0, tlift = 0;
+
+  if (S.estop) {
+    S.vx = S.vy = S.yaw = S.lift = 0;
+    setNote("■ 緊急停止中（再按一次解除）");
+  } else if (!fresh) {
+    S.vx = S.vy = S.yaw = S.lift = 0;
+    S.locked = false;
+    if (!S.estop) setNote(S.connected ? "未偵測到人體 · 原地待機" : "未偵測到人體");
+  } else {
+    /* ── (a) 雲台：快速鎖定目標 ─────────────────── */
+    const ex = dead(S.errX, TUNE.deadX);
+    const ey = dead(S.errY, TUNE.deadY);
+    S.pan  = clamp(S.pan  + (TUNE.panInvert ? -1:1) * TUNE.panK  * ex * dt, TUNE.panMin, TUNE.panMax);
+    S.tilt = clamp(S.tilt + (TUNE.tiltInvert ? 1:-1) * TUNE.tiltK * ey * dt, TUNE.tiltMin, TUNE.tiltMax);
+
+    /* ── (b) 車體轉向：跟隨雲台，讓雲台自然回正 ──── */
+    const panOff = S.pan - TUNE.panCenter;
+    tyaw = clamp(TUNE.yawK * dead(panOff, TUNE.yawDead), -TUNE.yawMax, TUNE.yawMax);
+
+    /* ── (c) 前後：靠軀幹長度控距離 ──────────────── */
+    const es = dead(S.errScale, TUNE.deadScale);
+    tvx = clamp(-TUNE.fwdK * es, -TUNE.fwdBackMax, TUNE.fwdMax * S.scaleConf);
+    //  ↑ scaleConf < 1 代表尺規不可靠（髖部被遮），前進速度自動打折
+
+    /* ── (d) 推桿：跟隨 tilt，追求平視構圖 ────────── */
+    const tiltOff = S.tilt - TUNE.tiltCenter;
+    tlift = Math.abs(tiltOff) > TUNE.liftDead ? Math.sign(tiltOff) : 0;
+
+    /* ── (e) 構圖鎖定判定 ───────────────────────── */
+    const good = Math.abs(S.errX) < TUNE.deadX * 1.3
+              && Math.abs(S.errY) < TUNE.deadY * 1.3
+              && Math.abs(S.errScale) < TUNE.deadScale * 1.2;
+    if (good) { if (!S.locked) { S.locked = true; S.lockAt = now; } }
+    else S.locked = false;
+
+    setNote(good ? "✔ 構圖鎖定 " + TUNE.modes[S.mode].label
+          : es !== 0 ? (es < 0 ? "接近主體…" : "距離過近 · 後退")
+          : ex !== 0 ? (ex > 0 ? "雲台右轉對準" : "雲台左轉對準")
+          : tlift !== 0 ? (tlift > 0 ? "升高鏡頭" : "降低鏡頭")
+          : "微調構圖…");
+  }
+
+  // 加減速限制：麥克納姆輪突然給滿值會打滑 + 電流尖峰
+  S.vx  += clamp(tvx  - S.vx,  -TUNE.slew, TUNE.slew);
+  S.yaw += clamp(tyaw - S.yaw, -TUNE.slew, TUNE.slew);
+  S.lift = tlift;
+
+  // 自動快門
+  if (S.auto && !S.estop && S.locked && !S.counting
+      && now - S.lockAt > TUNE.lockHold && now - S.lastShot > TUNE.cooldown) {
+    startCountdown();
+  }
+
+  // 固定封包格式：$D,vx,vy,yaw,lift,pan,tilt#
+  bleSend(`$D,${S.vx|0},${S.vy|0},${S.yaw|0},${S.lift},${S.pan|0},${S.tilt|0}#`);
+
+  $("tele").textContent = `FPS ${S.fps} · TX ${txCount}` + (lastTele ? " · " + lastTele : "");
+  $("status").classList.toggle("lock", S.locked);
+}
+setInterval(controlTick, 1000 / TUNE.sendHz);
+
+function setNote(t){ if (S.note !== t) { S.note = t; $("status").textContent = t; } }
+
+/* ═══════════════════════════════════════════════════════════
+   5. 視覺：MediaPipe Pose
+   ═══════════════════════════════════════════════════════════ */
+const video = $("cam"), view = $("view"), ctx = view.getContext("2d");
+const LINKS = [[11,12],[11,23],[12,24],[23,24],[11,13],[13,15],[12,14],[14,16],[23,25],[25,27],[24,26],[26,28]];
+const VIS = 0.5;
+let frames = 0, fpsAt = 0, pendingShot = false;
+
+function onResults(res) {
+  frames++;
+  const now = performance.now();
+  if (now - fpsAt >= 1000) { S.fps = frames; frames = 0; fpsAt = now; }
+
+  const w = res.image.width, h = res.image.height;
+  if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
+  const aspect = w / h;
+
+  // ① 先畫乾淨影像 —— 拍照只抓這一層，不會存到骨架
+  ctx.drawImage(res.image, 0, 0, w, h);
+  if (pendingShot) { pendingShot = false; saveFrame(); }
+
+  drawGrid(w, h);
+
+  const lm = res.poseLandmarks;
+  const okTorso = lm && lm[11].visibility > VIS && lm[12].visibility > VIS;
+
+  if (!okTorso) { S.hasTarget = false; return; }
+
+  const shC = { x:(lm[11].x+lm[12].x)/2, y:(lm[11].y+lm[12].y)/2 };
+  const hipOK = lm[23].visibility > VIS && lm[24].visibility > VIS;
+
+  // ── 尺規：優先用軀幹長度（不受轉身影響），髖部看不到才退回肩寬
+  let torso, conf;
+  if (hipOK) {
+    const hpC = { x:(lm[23].x+lm[24].x)/2, y:(lm[23].y+lm[24].y)/2 };
+    torso = Math.hypot((shC.x-hpC.x)*aspect, shC.y-hpC.y);
+    conf = 1.0;
+  } else {
+    // 肩寬 × 1.15 ≈ 軀幹長。可靠度較低 → 限制前進速度，避免誤判「太遠」而暴衝
+    torso = Math.hypot((lm[11].x-lm[12].x)*aspect, lm[11].y-lm[12].y) * 1.15;
+    conf = 0.5;
+  }
+
+  const M = TUNE.modes[S.mode];
+  S.torso = torso;
+  S.scaleConf = conf;
+  S.errX = shC.x - 0.5;
+  S.errY = shC.y - M.y;
+  S.errScale = (torso - M.torso) / M.torso;   // 相對誤差，換模式不用重調增益
+  S.hasTarget = true;
+  S.lastPoseAt = now;
+
+  drawSkeleton(lm, w, h, shC);
+}
+
+function drawGrid(w,h){
+  ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.lineWidth = Math.max(1, w/900);
+  ctx.beginPath();
+  ctx.moveTo(w/3,0); ctx.lineTo(w/3,h);
+  ctx.moveTo(w*2/3,0); ctx.lineTo(w*2/3,h);
+  ctx.moveTo(0,h/3); ctx.lineTo(w,h/3);
+  ctx.moveTo(0,h*2/3); ctx.lineTo(w,h*2/3);
+  ctx.stroke();
+}
+
+function drawSkeleton(lm,w,h,shC){
+  const k = Math.max(2, w/500);
+  ctx.strokeStyle = S.locked ? "#2ecc71" : "#00E5FF"; ctx.lineWidth = k;
+  LINKS.forEach(([i,j]) => {
+    if (lm[i].visibility > 0.4 && lm[j].visibility > 0.4) {
+      ctx.beginPath(); ctx.moveTo(lm[i].x*w, lm[i].y*h); ctx.lineTo(lm[j].x*w, lm[j].y*h); ctx.stroke();
+    }
+  });
+  // 目標構圖點（十字）與目前肩中點（圓）
+  const M = TUNE.modes[S.mode];
+  ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = k*0.7;
+  ctx.beginPath();
+  ctx.moveTo(w*0.5-k*6, M.y*h); ctx.lineTo(w*0.5+k*6, M.y*h);
+  ctx.moveTo(w*0.5, M.y*h-k*6); ctx.lineTo(w*0.5, M.y*h+k*6);
+  ctx.stroke();
+  ctx.fillStyle = S.locked ? "#2ecc71" : "#FF0055";
+  ctx.beginPath(); ctx.arc(shC.x*w, shC.y*h, k*3, 0, 6.2832); ctx.fill();
+}
+
+const pose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${f}` });
+pose.setOptions({
+  modelComplexity: 1,        // 手機端用 1；卡的話降 0。原本的 2 在手機只有個位數 FPS
+  smoothLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+pose.onResults(onResults);
+
+const camera = new Camera(video, {
+  onFrame: async () => { await pose.send({ image: video }); },
+  facingMode: 'environment',
+  width: 960, height: 540    // 降解析度換 FPS；控制迴路的延遲比畫質重要
+});
+camera.start().catch(e => {
+  setNote("相機啟動失敗：請確認已授權且使用 HTTPS");
+  console.error(e);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   6. 快門
+   ═══════════════════════════════════════════════════════════ */
+function startCountdown(){
+  S.counting = true;
+  let n = 3;
+  const el = $("count"); el.classList.remove("hide"); el.textContent = n;
+  bleSend("$BEEP,1#");
+  const t = setInterval(() => {
+    n--;
+    if (n > 0) { el.textContent = n; bleSend("$BEEP,1#"); }
+    else {
+      clearInterval(t); el.classList.add("hide"); S.counting = false;
+      shoot();
+    }
+  }, 1000);
+}
+
+function shoot(){
+  S.lastShot = performance.now();
+  pendingShot = true;              // 下一幀在畫 overlay 之前存檔
+  bleSend("$SNAP#");
+  const f = $("flash");
+  f.style.opacity = "0.9";
+  setTimeout(() => f.style.opacity = "0", 120);
+}
+
+function saveFrame(){
+  view.toBlob(b => {
+    const url = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = url; a.download = `PhotoBot_${Date.now()}.jpg`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }, "image/jpeg", 0.95);
+}
+
+$("shutter").onclick = () => { if (!S.counting) shoot(); };
+
+/* ═══════════════════════════════════════════════════════════
+   7. UI
+   ═══════════════════════════════════════════════════════════ */
+document.querySelectorAll(".mode").forEach(el => {
+  el.onclick = () => {
+    document.querySelectorAll(".mode").forEach(x => x.classList.remove("sel"));
+    el.classList.add("sel");
+    S.mode = el.dataset.mode;
+    S.locked = false;
+  };
+});
+
+$("autoBtn").onclick = () => {
+  S.auto = !S.auto;
+  $("autoBtn").textContent = S.auto ? "自動 ON" : "自動 OFF";
+  $("autoBtn").classList.toggle("on", S.auto);
+};
+
+$("estopBtn").onclick = () => {
+  S.estop = !S.estop;
+  $("estopBtn").classList.toggle("latched", S.estop);
+  $("estopBtn").textContent = S.estop ? "解除" : "停止";
+  if (S.estop) { S.vx = S.vy = S.yaw = S.lift = 0; bleSend("$STOP#"); }
+};
+
+// 切到背景 / 鎖屏 / 關頁 → 立刻停車
+function panicStop(){ S.vx=S.vy=S.yaw=S.lift=0; bleSend("$STOP#"); }
+document.addEventListener("visibilitychange", () => { if (document.hidden) panicStop(); });
+window.addEventListener("pagehide", panicStop);
+
+// 防止螢幕自動關閉（螢幕一暗整套控制就停）
+let wakeLock = null;
+async function keepAwake(){
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch(_){}
+}
+keepAwake();
+document.addEventListener("visibilitychange", () => { if (!document.hidden) keepAwake(); });
+</script>
+</body>
+</html>
