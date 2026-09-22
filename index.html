@@ -282,7 +282,8 @@ function controlTick() {
     else if (ey !== 0)    setNote(ey > 0 ? "雲台下俯對準" : "雲台上仰對準", false);
     else                  setNote("微調構圖…", false);
   }
-
+  // 倒數拍照中 → 強制車體靜止，避免快門瞬間還有殘餘晃動
+  if (S.counting) { tvx = 0; tyaw = 0; }
   // 加減速限制：麥克納姆輪突然給滿值會打滑 + 電流尖峰
   S.vx  += clamp(tvx  - S.vx,  -TUNE.slew, TUNE.slew);
   S.yaw += clamp(tyaw - S.yaw, -TUNE.slew, TUNE.slew);
